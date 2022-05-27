@@ -1,4 +1,4 @@
-import { Stack, StackProps } from 'aws-cdk-lib';
+import { CfnResource, Stack, StackProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as cdk from 'aws-cdk-lib';
 import { Asset } from 'aws-cdk-lib/aws-s3-assets';
@@ -6,9 +6,12 @@ import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
+import { aws_kinesisfirehose as kinesisfirehose } from 'aws-cdk-lib';
 import { aws_dms as dms } from 'aws-cdk-lib';
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import * as path from 'path';
+import { aws_glue as glue } from 'aws-cdk-lib';
 
 export class FinTransactionsStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
@@ -96,18 +99,19 @@ export class FinTransactionsStack extends Stack {
       }
     });
     
-    
+    // ingestion stack 
+
     // create a kinesis sgtream as target for the RDS data.
     const stream = new kinesis.Stream(this, 'TransactionDataStream', {
       streamName: 'fin-transactions-stream',
     });
 
     // setup a role to access the Database secret from dms
-    const serviceAccessRole = new iam.Role(this,"dbSecretAccessRole",{
+    const dmsServiceAccessRole = new iam.Role(this,"dbSecretAccessRole",{
       assumedBy: new iam.ServicePrincipal(`dms.${region}.amazonaws.com`),
     });
-    dbCluster.secret?.grantRead(serviceAccessRole);
-    stream.grantReadWrite(serviceAccessRole);
+    dbCluster.secret?.grantRead(dmsServiceAccessRole);
+    stream.grantReadWrite(dmsServiceAccessRole);
     
     
     // create the source endpoint for reading the Aurora Database
@@ -117,7 +121,7 @@ export class FinTransactionsStack extends Stack {
       // the properties below are optional
       databaseName: 'workshopDb',
       mySqlSettings: {
-          secretsManagerAccessRoleArn: serviceAccessRole.roleArn,
+          secretsManagerAccessRoleArn: dmsServiceAccessRole.roleArn,
           secretsManagerSecretId: dbCluster.secret!.secretArn,
       },
     });
@@ -131,7 +135,7 @@ export class FinTransactionsStack extends Stack {
         messageFormat: 'JSON',
         noHexPrefix: false,
         partitionIncludeSchemaTable: false,
-        serviceAccessRoleArn: serviceAccessRole.roleArn,
+        serviceAccessRoleArn: dmsServiceAccessRole.roleArn,
         streamArn: stream.streamArn,
       },
     });
@@ -143,7 +147,7 @@ export class FinTransactionsStack extends Stack {
       subnetIds: [
         vpc.privateSubnets[0].subnetId,
         vpc.privateSubnets[1].subnetId,
-        // vpc.publicSubnets[0].subnetId,
+        // vpc.publicSubnets[0].subnetId, // allow only private subnets since the DB is running in private subnet
         // vpc.publicSubnets[1].subnetId
       ],
     });
@@ -162,6 +166,47 @@ export class FinTransactionsStack extends Stack {
       targetEndpointArn: targetEndpoint.ref,
     });
 
+    // consumption stack
+    
+    const kinesisServiceAccessRole = new iam.Role(this,"kinesisServiceAccessRole",{
+      assumedBy: new iam.ServicePrincipal("firehose.amazonaws.com"),
+    });
+
+    const firehosePolicy = new iam.Policy(this, 'FirehosePolicy', {
+        roles: [kinesisServiceAccessRole],
+        statements: [
+            new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                resources: [stream.streamArn],
+                actions: ['kinesis:DescribeStream', 'kinesis:GetShardIterator', 'kinesis:GetRecords'],
+            }),
+        ],
+    });
+    stream.grantRead(kinesisServiceAccessRole);
+
+    // create a target s3 bucket.
+    const targetBucket = new s3.Bucket(this, "targetDataBucket");
+    targetBucket.grantReadWrite(kinesisServiceAccessRole);
+    
+
+    // create a kinesis data firehose delivery stream to move the data to S3
+    const firehoseDeliveryStream = new kinesisfirehose.CfnDeliveryStream(this, 'FinTransactionsDeliveryStream',
+      {
+        deliveryStreamName:"FinTransactionsDeliveryStream",
+        deliveryStreamType:"KinesisStreamAsSource",
+        s3DestinationConfiguration:{
+          bucketArn: targetBucket.bucketArn,
+          roleArn: kinesisServiceAccessRole.roleArn,
+        },
+        kinesisStreamSourceConfiguration:{
+          kinesisStreamArn: stream.streamArn,
+          roleArn: kinesisServiceAccessRole.roleArn,
+        }
+      }
+    );
+    firehoseDeliveryStream.addDependsOn(firehosePolicy.node.defaultChild as CfnResource);
+
+    // stack outputs
     new cdk.CfnOutput(
       this, 
       'generateDataCommand', 
