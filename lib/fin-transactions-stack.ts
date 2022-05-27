@@ -147,8 +147,7 @@ export class FinTransactionsStack extends Stack {
       subnetIds: [
         vpc.privateSubnets[0].subnetId,
         vpc.privateSubnets[1].subnetId,
-        // vpc.publicSubnets[0].subnetId, // allow only private subnets since the DB is running in private subnet
-        // vpc.publicSubnets[1].subnetId
+         // allow only private subnets since the DB is running in private subnet
       ],
     });
     
